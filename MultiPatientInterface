@@ -1,0 +1,590 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import json
+import os
+import csv
+import threading
+from datetime import datetime
+import requests
+from tkinter import scrolledtext
+
+
+class LibreViewAPI:
+    def __init__(self):
+        self.base_url = "https://api.libreview.io"
+        self.token = None
+        self.headers = {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+            'product': 'llu.android',
+            'version': '4.7'
+        }
+
+    def step1_login(self, email, password):
+        """Step 1: Initial login"""
+        login_url = f"{self.base_url}/llu/auth/login"
+        login_data = {"email": email, "password": password}
+
+        try:
+            response = requests.post(login_url, headers=self.headers, json=login_data)
+
+            if response.status_code == 200:
+                data = response.json()
+                status = data.get('status')
+
+                if status == 0:
+                    self.token = data.get('ticket', {}).get('token')
+                    return True, data
+                elif status == 4:
+                    step_type = data.get('data', {}).get('step', {}).get('type')
+                    self.token = data.get('data', {}).get('authTicket', {}).get('token')
+                    return step_type, data
+                else:
+                    return False, data
+            else:
+                return False, None
+
+        except Exception as e:
+            return False, str(e)
+
+    def step2_accept_document(self, doc_type):
+        """Step 2: Accept Terms of Use or Privacy Policy"""
+        accept_url = f"{self.base_url}/auth/continue/{doc_type}"
+        headers = self.headers.copy()
+        headers['Authorization'] = f"Bearer {self.token}"
+
+        try:
+            response = requests.post(accept_url, headers=headers)
+
+            if response.status_code == 200:
+                data = response.json()
+                status = data.get('status')
+
+                if status == 0:
+                    new_token = data.get('data', {}).get('authTicket', {}).get('token')
+                    if new_token:
+                        self.token = new_token
+                    return True, data
+                elif status == 4:
+                    next_step = data.get('data', {}).get('step', {}).get('type')
+                    new_token = data.get('data', {}).get('authTicket', {}).get('token')
+                    if new_token:
+                        self.token = new_token
+                    return next_step, data
+                else:
+                    return False, data
+            else:
+                return False, None
+
+        except Exception as e:
+            return False, str(e)
+
+    def step3_final_login(self, email, password):
+        """Step 3: Final login after all acceptances"""
+        login_url = f"{self.base_url}/llu/auth/login"
+        login_data = {"email": email, "password": password}
+
+        try:
+            response = requests.post(login_url, headers=self.headers, json=login_data)
+
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('status') == 0:
+                    self.token = data.get('ticket', {}).get('token')
+                    return True, data
+                else:
+                    return False, data
+            else:
+                return False, None
+
+        except Exception as e:
+            return False, str(e)
+
+    def step4_get_connections(self):
+        """Step 4: Get patient connections (sensors)"""
+        connections_url = f"{self.base_url}/llu/connections"
+        headers = self.headers.copy()
+        headers['Authorization'] = f"Bearer {self.token}"
+
+        try:
+            response = requests.get(connections_url, headers=headers)
+
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('status') == 0:
+                    connections = data.get('data', [])
+                    return True, connections
+                else:
+                    return False, data
+            else:
+                return False, None
+
+        except Exception as e:
+            return False, str(e)
+
+    def step5_get_glucose_data(self, patient_id):
+        """Step 5: Get glucose data from sensor"""
+        glucose_url = f"{self.base_url}/llu/connections/{patient_id}/graph"
+        headers = self.headers.copy()
+        headers['Authorization'] = f"Bearer {self.token}"
+
+        try:
+            response = requests.get(glucose_url, headers=headers)
+
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('status') == 0:
+                    return True, data
+                else:
+                    return False, data
+            else:
+                return False, None
+
+        except Exception as e:
+            return False, str(e)
+
+    def get_sensor_data(self, email, password):
+        """Get sensor data directly"""
+        # Step 1: Initial login
+        result, data = self.step1_login(email, password)
+        if not result:
+            return False, "Login failed"
+
+        # Step 2: Handle document acceptances
+        if result in ["tou", "pp"]:
+            current_step = result
+            max_steps = 3
+
+            for step_num in range(max_steps):
+                result, data = self.step2_accept_document(current_step)
+
+                if result is True:
+                    break
+                elif result in ["tou", "pp"]:
+                    current_step = result
+                else:
+                    return False, "Document acceptance failed"
+
+        # Step 3: Final login
+        result, data = self.step3_final_login(email, password)
+        if not result:
+            return False, "Final login failed"
+
+        # Step 4: Get connections (sensors)
+        result, connections = self.step4_get_connections()
+        if not result or not connections:
+            return False, "No sensor connections found"
+
+        # Step 5: Get glucose data from first sensor
+        first_patient_id = connections[0].get('patientId')
+        result, glucose_data = self.step5_get_glucose_data(first_patient_id)
+
+        if result:
+            return True, glucose_data
+        else:
+            return False, "Failed to retrieve glucose data"
+
+
+class PatientManager:
+    def __init__(self):
+        self.patients_file = "patients.json"
+        self.patients = self.load_patients()
+        self.data_folder = "glucose_data"
+        if not os.path.exists(self.data_folder):
+            os.makedirs(self.data_folder)
+
+    def load_patients(self):
+        """Load patients from JSON file"""
+        if os.path.exists(self.patients_file):
+            try:
+                with open(self.patients_file, 'r') as f:
+                    return json.load(f)
+            except:
+                return {}
+        return {}
+
+    def save_patients(self):
+        """Save patients to JSON file"""
+        with open(self.patients_file, 'w') as f:
+            json.dump(self.patients, f, indent=2)
+
+    def add_patient(self, name, email, password):
+        """Add a new patient"""
+        patient_id = f"patient_{len(self.patients) + 1}"
+        self.patients[patient_id] = {
+            "name": name,
+            "email": email,
+            "password": password,
+            "added_date": datetime.now().isoformat()
+        }
+        self.save_patients()
+        return patient_id
+
+    def remove_patient(self, patient_id):
+        """Remove a patient"""
+        if patient_id in self.patients:
+            del self.patients[patient_id]
+            self.save_patients()
+            return True
+        return False
+
+    def get_patients(self):
+        """Get all patients"""
+        return self.patients
+
+    def save_glucose_data_to_csv(self, patient_id, glucose_data):
+        """Save glucose data to CSV file"""
+        patient_name = self.patients[patient_id]["name"].replace(" ", "_")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{self.data_folder}/{patient_name}_{timestamp}.csv"
+
+        # Extract glucose data
+        glucose_readings = []
+
+        # Current measurement
+        connection = glucose_data.get('data', {}).get('connection', {})
+        current_measurement = connection.get('glucoseMeasurement', {})
+
+        if current_measurement:
+            glucose_readings.append({
+                'timestamp': current_measurement.get('Timestamp', ''),
+                'value_mg_dl': current_measurement.get('ValueInMgPerDl', ''),
+                'trend_message': current_measurement.get('TrendMessage', ''),
+                'is_high': current_measurement.get('isHigh', False),
+                'is_low': current_measurement.get('isLow', False),
+                'type': 'current'
+            })
+
+        # Historical data
+        graph_data = glucose_data.get('data', {}).get('graphData', [])
+        for reading in graph_data:
+            glucose_readings.append({
+                'timestamp': reading.get('Timestamp', ''),
+                'value_mg_dl': reading.get('ValueInMgPerDl', ''),
+                'trend_message': '',
+                'is_high': reading.get('isHigh', False),
+                'is_low': reading.get('isLow', False),
+                'type': 'historical'
+            })
+
+        # Write to CSV
+        if glucose_readings:
+            with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
+                fieldnames = ['timestamp', 'value_mg_dl', 'trend_message', 'is_high', 'is_low', 'type']
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+
+                writer.writeheader()
+                for reading in glucose_readings:
+                    writer.writerow(reading)
+
+        return filename
+
+
+class MultiPatientGlucoseApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Multi-Patient LibreView Glucose Data Manager")
+        self.root.geometry("1000x700")
+
+        self.patient_manager = PatientManager()
+        self.setup_ui()
+        self.refresh_patient_list()
+
+    def setup_ui(self):
+        """Setup the user interface"""
+        # Create main frame
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+
+        # Configure grid weights
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+        main_frame.columnconfigure(1, weight=1)
+        main_frame.rowconfigure(2, weight=1)
+
+        # Title
+        title_label = ttk.Label(main_frame, text="LibreView Multi-Patient Glucose Data Manager",
+                                font=('Arial', 16, 'bold'))
+        title_label.grid(row=0, column=0, columnspan=3, pady=(0, 20))
+
+        # Left panel - Patient Management
+        left_frame = ttk.LabelFrame(main_frame, text="Patient Management", padding="10")
+        left_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(0, 10))
+
+        # Add patient form
+        ttk.Label(left_frame, text="Patient Name:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.name_entry = ttk.Entry(left_frame, width=25)
+        self.name_entry.grid(row=0, column=1, pady=2, padx=(5, 0))
+
+        ttk.Label(left_frame, text="Email:").grid(row=1, column=0, sticky=tk.W, pady=2)
+        self.email_entry = ttk.Entry(left_frame, width=25)
+        self.email_entry.grid(row=1, column=1, pady=2, padx=(5, 0))
+
+        ttk.Label(left_frame, text="Password:").grid(row=2, column=0, sticky=tk.W, pady=2)
+        self.password_entry = ttk.Entry(left_frame, width=25, show="*")
+        self.password_entry.grid(row=2, column=1, pady=2, padx=(5, 0))
+
+        # Buttons
+        button_frame = ttk.Frame(left_frame)
+        button_frame.grid(row=3, column=0, columnspan=2, pady=10)
+
+        ttk.Button(button_frame, text="Add Patient", command=self.add_patient).pack(side=tk.LEFT, padx=2)
+        ttk.Button(button_frame, text="Remove Selected", command=self.remove_patient).pack(side=tk.LEFT, padx=2)
+        ttk.Button(button_frame, text="Clear Form", command=self.clear_form).pack(side=tk.LEFT, padx=2)
+
+        # Patient list
+        ttk.Label(left_frame, text="Patients:", font=('Arial', 10, 'bold')).grid(row=4, column=0, columnspan=2,
+                                                                                 sticky=tk.W, pady=(20, 5))
+
+        # Patient listbox with scrollbar
+        list_frame = ttk.Frame(left_frame)
+        list_frame.grid(row=5, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
+
+        self.patient_listbox = tk.Listbox(list_frame, height=8)
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.patient_listbox.yview)
+        self.patient_listbox.configure(yscrollcommand=scrollbar.set)
+
+        self.patient_listbox.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        # Right panel - Data Retrieval
+        right_frame = ttk.LabelFrame(main_frame, text="Data Retrieval", padding="10")
+        right_frame.grid(row=1, column=1, sticky=(tk.W, tk.E, tk.N, tk.S))
+        right_frame.columnconfigure(0, weight=1)
+        right_frame.rowconfigure(1, weight=1)
+
+        # Action buttons
+        action_frame = ttk.Frame(right_frame)
+        action_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+
+        ttk.Button(action_frame, text="Get Data for Selected Patient",
+                   command=self.get_single_patient_data).pack(side=tk.LEFT, padx=2)
+        ttk.Button(action_frame, text="Get Data for All Patients",
+                   command=self.get_all_patients_data).pack(side=tk.LEFT, padx=2)
+        ttk.Button(action_frame, text="Open Data Folder",
+                   command=self.open_data_folder).pack(side=tk.LEFT, padx=2)
+
+        # Progress bar
+        self.progress_var = tk.StringVar(value="Ready")
+        ttk.Label(right_frame, textvariable=self.progress_var).grid(row=1, column=0, sticky=tk.W)
+
+        self.progress_bar = ttk.Progressbar(right_frame, mode='indeterminate')
+        self.progress_bar.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=5)
+
+        # Log area
+        ttk.Label(right_frame, text="Log:", font=('Arial', 10, 'bold')).grid(row=3, column=0, sticky=tk.W, pady=(20, 5))
+
+        self.log_text = scrolledtext.ScrolledText(right_frame, height=15, width=60)
+        self.log_text.grid(row=4, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+
+        # Bottom status bar
+        self.status_var = tk.StringVar(value="Ready - Select a patient and click 'Get Data'")
+        status_bar = ttk.Label(main_frame, textvariable=self.status_var, relief=tk.SUNKEN)
+        status_bar.grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(10, 0))
+
+    def log_message(self, message):
+        """Add message to log"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
+        self.log_text.see(tk.END)
+        self.root.update()
+
+    def clear_log(self):
+        """Clear log area"""
+        self.log_text.delete(1.0, tk.END)
+
+    def add_patient(self):
+        """Add a new patient"""
+        name = self.name_entry.get().strip()
+        email = self.email_entry.get().strip()
+        password = self.password_entry.get().strip()
+
+        if not all([name, email, password]):
+            messagebox.showerror("Error", "Please fill in all fields")
+            return
+
+        try:
+            patient_id = self.patient_manager.add_patient(name, email, password)
+            self.refresh_patient_list()
+            self.clear_form()
+            self.log_message(f"Added patient: {name} ({email})")
+            self.status_var.set(f"Patient {name} added successfully")
+            messagebox.showinfo("Success", f"Patient {name} added successfully!")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to add patient: {str(e)}")
+
+    def remove_patient(self):
+        """Remove selected patient"""
+        selection = self.patient_listbox.curselection()
+        if not selection:
+            messagebox.showwarning("Warning", "Please select a patient to remove")
+            return
+
+        selected_index = selection[0]
+        patients = list(self.patient_manager.get_patients().items())
+        patient_id, patient_data = patients[selected_index]
+        patient_name = patient_data["name"]
+
+        if messagebox.askyesno("Confirm", f"Remove patient {patient_name}?"):
+            if self.patient_manager.remove_patient(patient_id):
+                self.refresh_patient_list()
+                self.log_message(f"Removed patient: {patient_name}")
+                self.status_var.set(f"Patient {patient_name} removed")
+                messagebox.showinfo("Success", f"Patient {patient_name} removed successfully!")
+
+    def clear_form(self):
+        """Clear input form"""
+        self.name_entry.delete(0, tk.END)
+        self.email_entry.delete(0, tk.END)
+        self.password_entry.delete(0, tk.END)
+
+    def refresh_patient_list(self):
+        """Refresh the patient listbox"""
+        self.patient_listbox.delete(0, tk.END)
+        patients = self.patient_manager.get_patients()
+
+        for patient_id, patient_data in patients.items():
+            display_text = f"{patient_data['name']} ({patient_data['email']})"
+            self.patient_listbox.insert(tk.END, display_text)
+
+    def get_single_patient_data(self):
+        """Get glucose data for selected patient"""
+        selection = self.patient_listbox.curselection()
+        if not selection:
+            messagebox.showwarning("Warning", "Please select a patient")
+            return
+
+        selected_index = selection[0]
+        patients = list(self.patient_manager.get_patients().items())
+        patient_id, patient_data = patients[selected_index]
+
+        # Run in separate thread to prevent UI freezing
+        thread = threading.Thread(target=self._retrieve_patient_data,
+                                  args=(patient_id, patient_data))
+        thread.daemon = True
+        thread.start()
+
+    def get_all_patients_data(self):
+        """Get glucose data for all patients"""
+        patients = self.patient_manager.get_patients()
+        if not patients:
+            messagebox.showwarning("Warning", "No patients added yet")
+            return
+
+        # Run in separate thread
+        thread = threading.Thread(target=self._retrieve_all_patients_data, args=(patients,))
+        thread.daemon = True
+        thread.start()
+
+    def _retrieve_patient_data(self, patient_id, patient_data):
+        """Retrieve data for a single patient (runs in thread)"""
+        try:
+            self.progress_bar.start()
+            self.progress_var.set(f"Retrieving data for {patient_data['name']}...")
+
+            api = LibreViewAPI()
+            self.log_message(f"Starting data retrieval for {patient_data['name']}")
+
+            success, data = api.get_sensor_data(patient_data['email'], patient_data['password'])
+
+            if success:
+                # Save to CSV
+                csv_file = self.patient_manager.save_glucose_data_to_csv(patient_id, data)
+                self.log_message(f"✅ Data saved to: {csv_file}")
+
+                # Extract current glucose value for display
+                connection = data.get('data', {}).get('connection', {})
+                current_measurement = connection.get('glucoseMeasurement', {})
+
+                if current_measurement:
+                    value = current_measurement.get('ValueInMgPerDl', 'N/A')
+                    trend = current_measurement.get('TrendMessage', 'N/A')
+                    self.log_message(f"Current glucose: {value} mg/dL, Trend: {trend}")
+
+                self.status_var.set(f"Data retrieved successfully for {patient_data['name']}")
+                messagebox.showinfo("Success", f"Data retrieved and saved for {patient_data['name']}")
+
+            else:
+                error_msg = str(data) if data else "Unknown error"
+                self.log_message(f"❌ Failed to retrieve data: {error_msg}")
+                self.status_var.set(f"Failed to retrieve data for {patient_data['name']}")
+                messagebox.showerror("Error", f"Failed to retrieve data for {patient_data['name']}: {error_msg}")
+
+        except Exception as e:
+            self.log_message(f"❌ Error: {str(e)}")
+            messagebox.showerror("Error", f"Error retrieving data: {str(e)}")
+        finally:
+            self.progress_bar.stop()
+            self.progress_var.set("Ready")
+
+    def _retrieve_all_patients_data(self, patients):
+        """Retrieve data for all patients (runs in thread)"""
+        try:
+            self.progress_bar.start()
+            total_patients = len(patients)
+            successful = 0
+            failed = 0
+
+            self.log_message(f"Starting bulk data retrieval for {total_patients} patients")
+
+            for i, (patient_id, patient_data) in enumerate(patients.items(), 1):
+                self.progress_var.set(f"Processing {i}/{total_patients}: {patient_data['name']}")
+                self.log_message(f"[{i}/{total_patients}] Processing {patient_data['name']}")
+
+                try:
+                    api = LibreViewAPI()
+                    success, data = api.get_sensor_data(patient_data['email'], patient_data['password'])
+
+                    if success:
+                        csv_file = self.patient_manager.save_glucose_data_to_csv(patient_id, data)
+                        self.log_message(f"✅ {patient_data['name']}: Data saved to {csv_file}")
+                        successful += 1
+                    else:
+                        error_msg = str(data) if data else "Unknown error"
+                        self.log_message(f"❌ {patient_data['name']}: {error_msg}")
+                        failed += 1
+
+                except Exception as e:
+                    self.log_message(f"❌ {patient_data['name']}: {str(e)}")
+                    failed += 1
+
+            # Summary
+            self.log_message(f"Bulk retrieval completed: {successful} successful, {failed} failed")
+            self.status_var.set(f"Bulk retrieval completed: {successful} successful, {failed} failed")
+
+            messagebox.showinfo("Bulk Retrieval Complete",
+                                f"Data retrieval completed!\n"
+                                f"Successful: {successful}\n"
+                                f"Failed: {failed}")
+
+        except Exception as e:
+            self.log_message(f"❌ Bulk retrieval error: {str(e)}")
+            messagebox.showerror("Error", f"Bulk retrieval error: {str(e)}")
+        finally:
+            self.progress_bar.stop()
+            self.progress_var.set("Ready")
+
+    def open_data_folder(self):
+        """Open the data folder in file explorer"""
+        try:
+            import subprocess
+            import sys
+
+            if sys.platform == "win32":
+                os.startfile(self.patient_manager.data_folder)
+            elif sys.platform == "darwin":
+                subprocess.run(["open", self.patient_manager.data_folder])
+            else:
+                subprocess.run(["xdg-open", self.patient_manager.data_folder])
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not open data folder: {str(e)}")
+
+
+def main():
+    root = tk.Tk()
+    app = MultiPatientGlucoseApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
